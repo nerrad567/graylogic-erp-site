@@ -1,0 +1,17 @@
+# Ignore sensitive/runtime data
+letsencrypt/
+postgres_data/
+odoo_data/
+*.log
+*.gpg
+*.tar
+*.gz
+.env
+__pycache__/
+*.pyc
+*.bak
+backups/
+.vscode/
+.idea/
+*.DS_Store
+*.swp

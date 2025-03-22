@@ -1,0 +1,136 @@
+services:
+  traefik:
+    depends_on:
+      - odoo
+    image: traefik:latest
+    env_file:
+      - .env
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--api.dashboard=true"
+      - "--certificatesresolvers.le.acme.email=${LE_EMAIL}"
+      - "--certificatesresolvers.le.acme.caServer=${LE_CA_SERVER}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.tlschallenge=true"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--accesslog.format=json"
+      - "--accesslog.fields.defaultmode=keep"
+      - "--accesslog.fields.names.RouterName=keep"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "letsencrypt:/letsencrypt"
+    labels:
+      - "traefik.enable=true"
+      # Dashboard router
+      - "traefik.http.routers.traefik-dashboard.rule=Host(`${DASHBOARD_DOMAIN}`)"
+      - "traefik.http.routers.traefik-dashboard.entrypoints=websecure"
+      - "traefik.http.routers.traefik-dashboard.tls=true"
+      - "traefik.http.routers.traefik-dashboard.tls.certresolver=le"
+      - "traefik.http.routers.traefik-dashboard.service=api@internal"
+      - "traefik.http.routers.traefik-dashboard.middlewares=dashboard-ip,dashboard-rate,dashboard-auth"
+      - "traefik.http.middlewares.dashboard-ip.ipallowlist.sourceRange=${DASHBOARD_IP_WHITELIST}"
+      - "traefik.http.middlewares.dashboard-rate.ratelimit.average=${DASHBOARD_RATE_LIMIT_AVERAGE}"
+      - "traefik.http.middlewares.dashboard-rate.ratelimit.burst=${DASHBOARD_RATE_LIMIT_BURST}"
+      - "traefik.http.middlewares.dashboard-rate.ratelimit.period=${DASHBOARD_RATE_LIMIT_PERIOD}"
+      - "traefik.http.middlewares.dashboard-auth.basicauth.users=${TRAEFIK_DASHBOARD_AUTH}"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:alpine
+    environment:
+      - POSTGRES_USER=${DB_ROOT_USER}
+      - POSTGRES_PASSWORD=${DB_ROOT_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  odoo:
+    image: odoo:latest
+    depends_on:
+      - postgres
+    command: [ "odoo", "--db-filter=^(${DB_NAME})$" ]
+    environment:
+      - HOST=postgres
+      - PORT=5432
+      - USER=${DB_ROOT_USER}
+      - PASSWORD=${DB_ROOT_PASSWORD}
+      - PROXY_MODE=True
+      - FORCE_HTTPS=True
+    volumes:
+      - odoo_data:/var/lib/odoo
+      - ./config:/etc/odoo
+      - ./addons:/mnt/extra-addons
+    labels:
+      - "traefik.enable=true"
+      # Dynamic content router (no cache)
+      - "traefik.http.routers.odoo-dynamic.rule=Host(`${CANONICAL_DOMAIN}`) && !PathPrefix(`/web/static`) && !PathPrefix(`/web/assets`) && !PathPrefix(`/web/image`) && !Path(`${VERIFICATION_FILE_PATH}`) && !PathPrefix(`/web/database`)"
+      - "traefik.http.routers.odoo-dynamic.entrypoints=websecure"
+      - "traefik.http.routers.odoo-dynamic.tls=true"
+      - "traefik.http.routers.odoo-dynamic.tls.certresolver=le"
+      - "traefik.http.routers.odoo-dynamic.service=odoo"
+      - "traefik.http.routers.odoo-dynamic.middlewares=odoo-https-header,compress"
+      # Static content router (Odoo static assets)
+      - "traefik.http.routers.odoo-static.rule=Host(`${CANONICAL_DOMAIN}`) && (PathPrefix(`/web/static`) || PathPrefix(`/web/assets`) || PathPrefix(`/web/image`) || PathPrefix(`/unsplash`))"
+      - "traefik.http.routers.odoo-static.entrypoints=websecure"
+      - "traefik.http.routers.odoo-static.tls=true"
+      - "traefik.http.routers.odoo-static.tls.certresolver=le"
+      - "traefik.http.routers.odoo-static.service=odoo"
+      - "traefik.http.routers.odoo-static.middlewares=odoo-https-header,compress,odoo-cache"
+      - "traefik.http.middlewares.odoo-cache.headers.customresponseheaders.Cache-Control=public, max-age=31536000, immutable"
+      # Service definition
+      - "traefik.http.services.odoo.loadbalancer.server.port=8069"
+      - "traefik.http.middlewares.odoo-https-header.headers.customrequestheaders.X-Forwarded-Proto=https"
+      - "traefik.http.middlewares.compress.compress=true"
+      # Database router
+      - "traefik.http.routers.odoo-db.rule=Host(`${CANONICAL_DOMAIN}`) && PathPrefix(`/web/database`)"
+      - "traefik.http.routers.odoo-db.entrypoints=websecure"
+      - "traefik.http.routers.odoo-db.tls=true"
+      - "traefik.http.routers.odoo-db.tls.certresolver=le"
+      - "traefik.http.routers.odoo-db.service=odoo"
+      - "traefik.http.routers.odoo-db.middlewares=odoo-db-ip,odoo-db-rate,odoo-db-auth,odoo-https-header"
+      - "traefik.http.middlewares.odoo-db-ip.ipallowlist.sourceRange=${DASHBOARD_IP_WHITELIST}"
+      - "traefik.http.middlewares.odoo-db-rate.ratelimit.average=${DASHBOARD_RATE_LIMIT_AVERAGE}"
+      - "traefik.http.middlewares.odoo-db-rate.ratelimit.burst=${DASHBOARD_RATE_LIMIT_BURST}"
+      - "traefik.http.middlewares.odoo-db-rate.ratelimit.period=${DASHBOARD_RATE_LIMIT_PERIOD}"
+      - "traefik.http.middlewares.odoo-db-auth.basicauth.users=${ODOO_DB_MANAGER_AUTH}"
+      # Redirect router
+      - "traefik.http.routers.odoo-redirect.rule=Host(`${REDIRECT_DOMAINS}`)"
+      - "traefik.http.routers.odoo-redirect.entrypoints=websecure"
+      - "traefik.http.routers.odoo-redirect.tls=true"
+      - "traefik.http.routers.odoo-redirect.tls.certresolver=le"
+      - "traefik.http.routers.odoo-redirect.middlewares=redirect-to-canonical"
+      - "traefik.http.middlewares.redirect-to-canonical.redirectregex.regex=^https?://(?:${REDIRECT_DOMAINS_REGEX})(.*)$"
+      - "traefik.http.middlewares.redirect-to-canonical.redirectregex.replacement=https://${CANONICAL_DOMAIN}$1"
+      - "traefik.http.middlewares.redirect-to-canonical.redirectregex.permanent=true"
+    restart: unless-stopped
+
+  static-files:
+    image: nginx:alpine
+    volumes:
+      - ./static:/usr/share/nginx/html
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.static.rule=Host(`${CANONICAL_DOMAIN}`) && Path(`${VERIFICATION_FILE_PATH}`)"
+      - "traefik.http.routers.static.entrypoints=websecure"
+      - "traefik.http.routers.static.tls=true"
+      - "traefik.http.routers.static.tls.certresolver=le"
+      - "traefik.http.routers.static.priority=10000"
+      - "traefik.http.routers.static.service=static"
+      - "traefik.http.services.static.loadbalancer.server.port=80"
+      - "traefik.http.routers.static.middlewares=static-cache"
+      - "traefik.http.middlewares.static-cache.headers.customresponseheaders.Cache-Control=public, max-age=31536000, immutable"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  odoo_data:
+  letsencrypt:
