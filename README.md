@@ -1,12 +1,13 @@
-# graylogic.uk – Real Business ERP with Docker, Odoo, and Traefik
+# 🌐 graylogic.uk – Real Business ERP with Docker, Odoo, and Traefik
 
 [![Live Site](https://img.shields.io/badge/Live-graylogic.uk-success?style=for-the-badge&logo=firefoxbrowser)](https://www.graylogic.uk)
-![Built in Spare Time](https://img.shields.io/badge/Built%20in-Spare%20Time-blueviolet?style=for-the-badge&logo=clock)
-![Self-Hosted](https://img.shields.io/badge/Hosting-Hetzner%20Cloud-red?style=for-the-badge&logo=ubuntu)
+![Platform](https://img.shields.io/badge/Platform-Ubuntu%20VM-blue?style=for-the-badge&logo=ubuntu)
+![ERP Stack](https://img.shields.io/badge/Stack-Odoo%20%7C%20PostgreSQL-8E44AD?style=for-the-badge&logo=odoo)
+![Containerized](https://img.shields.io/badge/Containers-Docker%20%7C%20Traefik-2496ED?style=for-the-badge&logo=docker)
+![Automation](https://img.shields.io/badge/Scripting-Bash%20%7C%20PowerShell-4B275F?style=for-the-badge&logo=gnubash)
+![Backups](https://img.shields.io/badge/Backups-GPG%20Encrypted-critical?style=for-the-badge&logo=gnuprivacyguard)
+![Security](https://img.shields.io/badge/Secure_by-Design-2ea44f?style=for-the-badge&logo=shield)
 ![Status](https://img.shields.io/badge/Status-Production-green?style=for-the-badge&logo=server)
-![Security](https://img.shields.io/badge/Backups-Encrypted%20%26%20Wiped-critical?style=for-the-badge&logo=lock)
-![Secure by Design](https://img.shields.io/badge/Secure_by-Design-2ea44f?style=for-the-badge&logo=shield)
-![Built with Bash & PowerShell](https://img.shields.io/badge/Bash_&_PowerShell-Automation-blue?style=for-the-badge&logo=gnubash&logoColor=white)
 
 
 A self-hosted, production-grade Odoo stack powering my electrical business website [graylogic.uk](https://www.graylogic.uk). Built in my spare time while working full-time as an electrician, this project showcases my ability to manage infrastructure, automate deployments, and secure live services.
