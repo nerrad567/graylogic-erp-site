@@ -233,12 +233,22 @@ Your routing layer:
 This is a production-grade routing setup, tailored to Odoo’s architecture and hardened for real-world use.
 
 
+---
+
+## 📝 Author
+
+**Darren Gray**
+Researched, developed, and refined with assistance from ChatGPT and Grok AI
+
 ## 📬 Contact
 
 - **GitHub**: [@nerrad567](https://github.com/nerrad567)
 - **Email**: darren.g@outlook.com
 - **LinkedIn**: [linkedin.com/in/darren-gray-70258a169](https://www.linkedin.com/in/darren-gray-70258a169)
 
+### 📄 License
+
+MIT
+
 ---
 
-> ⚠️ Note: Sensitive values (e.g. passwords, keys, and environment files) are excluded. Replace with your own if replicating this stack.
