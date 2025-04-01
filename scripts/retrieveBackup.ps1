@@ -1,50 +1,102 @@
 <#
 .SYNOPSIS
-    Fetches, decrypts, expands, and securely manages encrypted backups from a specified domain.
+    Fetches, decrypts, expands, and securely manages encrypted backups.
 .DESCRIPTION
-    This script handles sensitive backup operations with options to fetch, decrypt, and expand files,
-    or securely wipe confidential data. It ensures proper error handling, user confirmation, and secure cleanup.
+    This script retrieves the latest encrypted backup starting with a prefix (default: odoo_full_backup_) via SCP by default,
+    stores it in an encrypted backups folder, skipping if MD5 matches or appending a label if different.
+    With -Decrypt, it lists available encrypted files, prompts the user to select one, decrypts it with GPG, and extracts
+    contents using 7-Zip into a working folder. Provides secure cleanup options. Variables are loaded from an external config file.
 .PARAMETER WipeConfidential
-    Switch to securely delete confidential files without running the full backup process.
+    Switch to securely delete confidential files from the working folder without affecting encrypted backups.
+.PARAMETER Decrypt
+    Switch to enable decryption and extraction, prompting the user to select an encrypted file from the backups folder.
 .EXAMPLE
-    .\BackupScript.ps1 -WipeConfidential
-    .\BackupScript.ps1
+    .\ConfidentialBackupRetriever.ps1                            # Fetches the latest remote backup, skips if MD5 matches
+    .\ConfidentialBackupRetriever.ps1 -WipeConfidential         # Wipes the working folder
+    .\ConfidentialBackupRetriever.ps1 -Decrypt                  # Prompts to decrypt a local encrypted file
 .NOTES
-    Author: GL Maintenance
-    Date: February 24, 2025
+    Author: Darren Gray
+    Credits: Developed with assistance from ChatGPT and Grok (xAI)
+    Date: March 31, 2025
     Requires: Gpg4win, 7-Zip, SDelete, OpenSSH
+    Config File: Expected at <ONEDRIVE_FOLDER>\backup_config.env
 #>
+
 param (
-    [switch]$WipeConfidential
+    [switch]$WipeConfidential,
+    [switch]$Decrypt
 )
 
-# Configuration Variables
-$DOMAIN = "[DOMAIN]"              # Replace with your domain (e.g., example.com)
-$SSH_USER = "[SSH_USER]"          # Replace with your SSH username
-$KEYBASE_USER = "[KEYBASE_USER]"  # Replace with your Keybase username
-$USERNAME = "[USERNAME]"          # Replace with your Windows username
+# region Configuration Loading
+$CONFIG_NAME = "backup_config.env"
 
-# Constants
-$BACKUPS_FOLDER = "C:\Users\$USERNAME\backups"  # Remove trailing backslash
-$ODOO_FOLDER = Join-Path -Path $BACKUPS_FOLDER -ChildPath "odoo-traefik"  # Use Join-Path for clean path construction
-$SDELETE_PATH = Join-Path -Path $BACKUPS_FOLDER -ChildPath "sdelete.exe"
-$SEVENZIP_PATH = "C:\Program Files\7-Zip\7z.exe"
-$LOG_FILE = Join-Path -Path $BACKUPS_FOLDER -ChildPath "backup_script.log"
-$ONEDRIVE_FOLDER = "C:\Users\$USERNAME\OneDrive\Documents\$DOMAIN-Website\backups\docker_configs"
+if (-not (Test-Path $CONFIG_NAME)) {
+    Write-Host "Error: Config file '$CONFIG_NAME' not found in the script's directory." -ForegroundColor Red
+    Write-Host "Please create '$CONFIG_NAME' with the following variables:" -ForegroundColor Yellow
+    Write-Host "  ONEDRIVE_FOLDER=<path>         # OneDrive base folder (e.g., C:\Users\<user>\OneDrive\Documents\backups)"
+    Write-Host "  SDELETE_PATH=<path>            # Path to sdelete.exe (e.g., C:\Users\<user>\OneDrive\Documents\backups\sdelete.exe)"
+    Write-Host "  SEVENZIP_PATH=<path>           # Path to 7z.exe (e.g., C:\Program Files\7-Zip\7z.exe)"
+    Write-Host "  REMOTE_HOST=<user@host>        # SSH remote host (e.g., user@domain.com)"
+    Write-Host "  REMOTE_BACKUP_DIR=<path>       # Remote backup directory (e.g., /home/user/backups)"
+    Write-Host "  BACKUP_PREFIX=<string>         # Prefix for backup files (e.g., odoo_full_backup_)"
+    Write-Host "Create this file in the script's directory and rerun the script." -ForegroundColor Yellow
+    exit 1
+}
 
-# Utility Functions
+$config = @{}
+Get-Content $CONFIG_NAME | ForEach-Object {
+    if ($_ -match "^\s*([^#=]+?)\s*=\s*(.+?)\s*(?:#.*)?$") {
+        $config[$matches[1]] = $matches[2]
+    }
+}
+
+if (-not $config["ONEDRIVE_FOLDER"]) { Write-Host "Error: ONEDRIVE_FOLDER not set in config" -ForegroundColor Red; exit 1 }
+$ONEDRIVE_FOLDER = $config["ONEDRIVE_FOLDER"]
+if (-not $config["SDELETE_PATH"]) { Write-Host "Error: SDELETE_PATH not set in config" -ForegroundColor Red; exit 1 }
+$SDELETE_PATH = $config["SDELETE_PATH"]
+if (-not $config["SEVENZIP_PATH"]) { Write-Host "Error: SEVENZIP_PATH not set in config" -ForegroundColor Red; exit 1 }
+$SEVENZIP_PATH = $config["SEVENZIP_PATH"]
+if (-not $config["REMOTE_HOST"]) { Write-Host "Error: REMOTE_HOST not set in config" -ForegroundColor Red; exit 1 }
+$REMOTE_HOST = $config["REMOTE_HOST"]
+if (-not $config["REMOTE_BACKUP_DIR"]) { Write-Host "Error: REMOTE_BACKUP_DIR not set in config" -ForegroundColor Red; exit 1 }
+$REMOTE_BACKUP_DIR = $config["REMOTE_BACKUP_DIR"]
+if (-not $config["BACKUP_PREFIX"]) { Write-Host "Error: BACKUP_PREFIX not set in config" -ForegroundColor Red; exit 1 }
+$BACKUP_PREFIX = $config["BACKUP_PREFIX"]
+
+$WORKING_FOLDER = Join-Path -Path $ONEDRIVE_FOLDER -ChildPath "working"
+$ENCRYPTED_BACKUPS_FOLDER = Join-Path -Path $ONEDRIVE_FOLDER -ChildPath "encrypted_backups"
+
+if (-not (Test-Path $WORKING_FOLDER)) {
+    New-Item -Path $WORKING_FOLDER -ItemType Directory -Force | Out-Null
+}
+if (-not (Test-Path $ENCRYPTED_BACKUPS_FOLDER)) {
+    New-Item -Path $ENCRYPTED_BACKUPS_FOLDER -ItemType Directory -Force | Out-Null
+}
+
+$LOG_FILE = Join-Path -Path $WORKING_FOLDER -ChildPath "backup_script.log"
+# endregion
+
+# region Utility Functions
 function Write-Banner {
+    <#
+    .SYNOPSIS
+        Displays a warning banner about handling sensitive data.
+    #>
     Write-Host "=============================================================" -ForegroundColor Red
     Write-Host " Backup Fetcher & Decryptor" -ForegroundColor Yellow
-    Write-Host " WARNING: Handles HIGHLY SENSITIVE DATA from $DOMAIN." -ForegroundColor Red
-    Write-Host " Exposure risks customer data and legal consequences." -ForegroundColor Red
+    Write-Host " WARNING: Handles HIGHLY SENSITIVE DATA from a remote server." -ForegroundColor Red
+    Write-Host " Exposure risks sensitive data and legal consequences." -ForegroundColor Red
     Write-Host " Use -WipeConfidential to securely delete sensitive files." -ForegroundColor Cyan
-    Write-Host " Note: On SSDs, secure deletion may be less effective due to TRIM/wear-leveling." -ForegroundColor Cyan
-    Write-Host "       For end-of-life, run 'sdelete -z' then physically destroy the drive." -ForegroundColor Cyan
+    Write-Host " Note: SSD secure deletion may be less effective (TRIM/wear-leveling)." -ForegroundColor Cyan
+    Write-Host "       For end-of-life, run 'sdelete -z' then destroy drive." -ForegroundColor Cyan
     Write-Host "=============================================================" -ForegroundColor Red
 }
 
 function Write-Log {
+    <#
+    .SYNOPSIS
+        Logs messages to file and console with timestamp and color.
+    #>
     param (
         [string]$Message,
         [ConsoleColor]$ForegroundColor = "White"
@@ -55,319 +107,287 @@ function Write-Log {
 }
 
 function Test-Prerequisites {
-    if (-not (Test-Path $BACKUPS_FOLDER)) {
-        Write-Log "Error: Backups folder '$BACKUPS_FOLDER' not found." -ForegroundColor Red
-        Write-Log "Run: New-Item -Path '$BACKUPS_FOLDER' -ItemType Directory" -ForegroundColor Yellow
-        Write-Log "Install: Gpg4win, 7-Zip, SDelete, and import public key." -ForegroundColor Cyan
-        Write-Log "Key Location: Keybase: https://keybase.io/$KEYBASE_USER/pgp_keys.asc" -ForegroundColor Cyan
-        Write-Log "Run: Invoke-WebRequest -Uri 'https://keybase.io/$KEYBASE_USER/pgp_keys.asc' -OutFile '$BACKUPS_FOLDER\$KEYBASE_USER_public_key.asc'" -ForegroundColor Cyan
-        Write-Log "Then: gpg --import '$BACKUPS_FOLDER\$KEYBASE_USER_public_key.asc'" -ForegroundColor Cyan
-        exit 1
-    }
-    if (-not (Test-Path $SDELETE_PATH)) {
-        Write-Log "Error: SDelete not found at '$SDELETE_PATH'." -ForegroundColor Red
-        Write-Log "Download from: https://learn.microsoft.com/en-us/sysinternals/downloads/sdelete" -ForegroundColor Yellow
-        exit 1
-    }
-    if (-not (Test-Path $SEVENZIP_PATH)) {
-        Write-Log "Error: 7-Zip not found at '$SEVENZIP_PATH'." -ForegroundColor Red
-        Write-Log "Install from: https://www.7-zip.org/" -ForegroundColor Yellow
+    <#
+    .SYNOPSIS
+        Verifies required tools and permissions are available within OneDrive.
+    #>
+    if (-not (Test-Path $WORKING_FOLDER)) { Write-Log "Error: Working folder '$WORKING_FOLDER' not found." -ForegroundColor Red; exit 1 }
+    if (-not (Test-Path $ENCRYPTED_BACKUPS_FOLDER)) { Write-Log "Error: Encrypted backups folder '$ENCRYPTED_BACKUPS_FOLDER' not found." -ForegroundColor Red; exit 1 }
+    if (-not (Test-Path $SDELETE_PATH)) { Write-Log "Error: SDelete not found at '$SDELETE_PATH'." -ForegroundColor Red; exit 1 }
+    if (-not (Test-Path $SEVENZIP_PATH)) { Write-Log "Error: 7-Zip not found at '$SEVENZIP_PATH'." -ForegroundColor Red; exit 1 }
+    if (-not (Get-Command "gpg" -ErrorAction SilentlyContinue)) { Write-Log "Error: GPG (Gpg4win) not found in PATH." -ForegroundColor Red; exit 1 }
+    if (-not (Get-Command "scp" -ErrorAction SilentlyContinue)) { Write-Log "Error: SCP (OpenSSH) not found in PATH." -ForegroundColor Red; exit 1 }
+    if (-not (Get-Command "ssh" -ErrorAction SilentlyContinue)) { Write-Log "Error: SSH not found in PATH. Required for listing remote files." -ForegroundColor Red; exit 1 }
+    try {
+        "test" | Out-File "$WORKING_FOLDER\test.txt" -Force
+        Remove-Item "$WORKING_FOLDER\test.txt" -Force
+    } catch {
+        Write-Log "Error: No write permissions to '$WORKING_FOLDER'. Run as Administrator." -ForegroundColor Red
         exit 1
     }
     try {
-        $testFile = "$BACKUPS_FOLDER\test.txt"
-        "test" | Out-File $testFile
-        Remove-Item $testFile -Force
-    }
-    catch {
-        Write-Log "Error: No write permissions to '$BACKUPS_FOLDER'. Run as Administrator." -ForegroundColor Red
+        "test" | Out-File "$ENCRYPTED_BACKUPS_FOLDER\test.txt" -Force
+        Remove-Item "$ENCRYPTED_BACKUPS_FOLDER\test.txt" -Force
+    } catch {
+        Write-Log "Error: No write permissions to '$ENCRYPTED_BACKUPS_FOLDER'. Run as Administrator." -ForegroundColor Red
         exit 1
     }
 }
 
 function Confirm-Action {
+    <#
+    .SYNOPSIS
+        Prompts user for confirmation.
+    #>
     param ([string]$Message)
     $response = Read-Host "$Message (yes/no)"
     return $response -eq "yes"
 }
 
 function Remove-SecureFile {
+    <#
+    .SYNOPSIS
+        Securely deletes a file using SDelete.
+    #>
     param ([string]$Path)
     if (Test-Path $Path) {
         Write-Log "Securely deleting '$Path'..." -ForegroundColor Green
         & $SDELETE_PATH -p 3 -r -s $Path
-        if ($LASTEXITCODE -ne 0) {
+        if ($LASTEXITCODE -ne 0 -or (Test-Path $Path)) {
             Write-Log "Warning: Secure deletion of '$Path' may have failed." -ForegroundColor Yellow
         }
-        elseif (Test-Path $Path) {
-            Write-Log "Error: '$Path' still exists after secure deletion attempt." -ForegroundColor Red
-        }
     }
-}
-
-function Remove-ConfidentialFiles {
-    Write-Log "Running fail-safe cleanup of confidential files..." -ForegroundColor Yellow
-    Get-ChildItem -Path $BACKUPS_FOLDER -Filter "*.gz" | ForEach-Object { 
-        if ($_.FullName -ne $decryptedPath) {
-            # Avoid double-deletion if already handled
-            Remove-SecureFile -Path $_.FullName 
-        }
-    }
-    Get-ChildItem -Path $BACKUPS_FOLDER -Filter "*.tar" | ForEach-Object { 
-        Remove-SecureFile -Path $_.FullName 
-    }
-    Write-Log "Fail-safe cleanup complete. Only '$ODOO_FOLDER' should remain with intended contents." -ForegroundColor Green
 }
 
 function Clear-ConfidentialFiles {
-    Write-Log "Running in -WipeConfidential mode:" -ForegroundColor Yellow
-    Write-Log "Deleting all .gz, .tar, and odoo-traefik contents." -ForegroundColor Cyan
-    
-    if (Confirm-Action "Proceed with secure wipe?") {
-        $deleteFailed = $false
-        
-        # Delete all .gz files
-        $gzFiles = Get-ChildItem -Path $BACKUPS_FOLDER -Filter "*.gz" -ErrorAction SilentlyContinue
-        foreach ($file in $gzFiles) {
-            Remove-SecureFile -Path $file.FullName
-            if (Test-Path $file.FullName) {
-                Write-Log "Failed to delete '$($file.FullName)'." -ForegroundColor Red
-                $deleteFailed = $true
-            }
+    <#
+    .SYNOPSIS
+        Securely wipes all files and subdirectories in the working directory, preserving the log file.
+    #>
+    Write-Log "Running -WipeConfidential mode..." -ForegroundColor Yellow
+    if (Confirm-Action "Proceed with secure wipe of all contents in '$WORKING_FOLDER' (except log file)?") {
+        Get-ChildItem -Path $WORKING_FOLDER -Exclude "backup_script.log" -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-SecureFile -Path $_.FullName
         }
-
-        # Delete all .tar files
-        $tarFiles = Get-ChildItem -Path $BACKUPS_FOLDER -Filter "*.tar" -ErrorAction SilentlyContinue
-        foreach ($file in $tarFiles) {
-            Remove-SecureFile -Path $file.FullName
-            if (Test-Path $file.FullName) {
-                Write-Log "Failed to delete '$($file.FullName)'." -ForegroundColor Red
-                $deleteFailed = $true
-            }
-        }
-
-        # Delete odoo-traefik folder and its contents recursively
-        if (Test-Path $ODOO_FOLDER) {
-            Write-Log "Securely deleting folder '$ODOO_FOLDER' and all contents..." -ForegroundColor Green
-            # Ensure path is clean before passing to sdelete
-            $cleanOdooFolder = $ODOO_FOLDER.TrimEnd('\')
-            & $SDELETE_PATH -p 3 -r -s $cleanOdooFolder
-            if ($LASTEXITCODE -ne 0) {
-                Write-Log "Warning: Secure deletion of '$cleanOdooFolder' may have failed (exit code: $LASTEXITCODE)." -ForegroundColor Yellow
-                $deleteFailed = $true
-            }
-            if (Test-Path $cleanOdooFolder) {
-                Write-Log "Error: '$cleanOdooFolder' still exists after secure deletion attempt." -ForegroundColor Red
-                $deleteFailed = $true
-            }
-            else {
-                Write-Log "Folder '$cleanOdooFolder' successfully deleted." -ForegroundColor Green
-            }
-        }
-        else {
-            Write-Log "Folder '$ODOO_FOLDER' does not exist; skipping deletion." -ForegroundColor Yellow
-        }
-
-        # Report final status
-        if (-not $deleteFailed) {
-            Write-Log "Confidential files and folder securely deleted." -ForegroundColor Green
-        }
-        else {
-            Write-Log "Some confidential files or the folder could not be deleted. Manual cleanup required." -ForegroundColor Red
-        }
-    }
-    else {
+        Write-Log "All confidential files and subdirectories in '$WORKING_FOLDER' wiped (log file preserved)." -ForegroundColor Green
+    } else {
         Write-Log "Wipe cancelled." -ForegroundColor Yellow
     }
     exit 0
 }
 
-function Get-BackupFileName {
-    do {
-        $fileName = Read-Host "Enter encrypted backup file name (e.g., $($DOMAIN)_..._20250224_1514.tar.gz.gpg)"
-        if ([string]::IsNullOrEmpty($fileName)) {
-            Write-Log "Error: File name cannot be empty." -ForegroundColor Red
-        }
-        elseif (-not ($fileName -match "\.tar\.gz\.gpg$")) {
-            Write-Log "Warning: File should end in .tar.gz.gpg." -ForegroundColor Yellow
-            if (-not (Confirm-Action "Proceed anyway?")) {
-                $fileName = $null
-            }
-        }
-    } while ([string]::IsNullOrEmpty($fileName))
+function Get-LatestRemoteBackup {
+    <#
+    .SYNOPSIS
+        Retrieves the latest backup file from the remote directory matching the BACKUP_PREFIX.
+    #>
+    Write-Log "Fetching list of remote backups from '$REMOTE_HOST`:$REMOTE_BACKUP_DIR'..." -ForegroundColor Green
+    $tempFile = Join-Path -Path $WORKING_FOLDER -ChildPath "remote_files.txt"
+    $sshCommand = "ls -t $REMOTE_BACKUP_DIR/$BACKUP_PREFIX*.tar.gz.gpg"
+    $sshProcess = Start-Process -FilePath "ssh" -ArgumentList "$REMOTE_HOST", "$sshCommand" -Wait -NoNewWindow -PassThru -RedirectStandardOutput $tempFile -RedirectStandardError "$WORKING_FOLDER\ssh_error.txt"
+    
+    if ($sshProcess.ExitCode -ne 0) {
+        $errorContent = Get-Content "$WORKING_FOLDER\ssh_error.txt" -ErrorAction SilentlyContinue
+        Write-Log "Error: Failed to list remote files. SSH exit code: $($sshProcess.ExitCode). Error: $errorContent" -ForegroundColor Red
+        Remove-Item "$WORKING_FOLDER\ssh_error.txt" -Force -ErrorAction SilentlyContinue
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+        exit 1
+    }
+    
+    $files = Get-Content $tempFile -ErrorAction SilentlyContinue
+    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    Remove-Item "$WORKING_FOLDER\ssh_error.txt" -Force -ErrorAction SilentlyContinue
+    
+    if (-not $files) {
+        Write-Log "Error: No files found matching '$BACKUP_PREFIX*.tar.gz.gpg' in '$REMOTE_BACKUP_DIR'." -ForegroundColor Red
+        exit 1
+    }
+    
+    # Take the first file (latest due to -t sorting)
+    $latestFile = $files | Select-Object -First 1
+    $fileName = Split-Path -Leaf $latestFile
+    Write-Log "Latest backup identified: '$fileName'" -ForegroundColor Green
     return $fileName
 }
 
-function Copy-BackupFromRemote {
-    param (
-        [string]$RemotePath,
-        [string]$LocalPath
-    )
-    if (Test-Path $LocalPath) {
-        if (-not (Confirm-Action "Overwrite existing file '$LocalPath'?")) {
-            Write-Log "Fetch cancelled." -ForegroundColor Red
-            exit 1
-        }
+function Get-RemoteFileMD5 {
+    <#
+    .SYNOPSIS
+        Retrieves the MD5 hash of a remote file using ssh and md5sum.
+    #>
+    param ([string]$RemotePath)
+    
+    $filePath = $RemotePath -replace "^$REMOTE_HOST\:", ""
+    Write-Log "Calculating MD5 hash for remote file '$filePath'..." -ForegroundColor Green
+    $tempFile = Join-Path -Path $WORKING_FOLDER -ChildPath "remote_md5.txt"
+    $sshCommand = "md5sum $filePath"
+    $sshProcess = Start-Process -FilePath "ssh" -ArgumentList "$REMOTE_HOST", "$sshCommand" -Wait -NoNewWindow -PassThru -RedirectStandardOutput $tempFile -RedirectStandardError "$WORKING_FOLDER\ssh_error.txt" 
+    
+    if ($sshProcess.ExitCode -ne 0) {
+        $errorContent = Get-Content "$WORKING_FOLDER\ssh_error.txt" -ErrorAction SilentlyContinue
+        Write-Log "Error: Failed to get MD5 hash of remote file. SSH exit code: $($sshProcess.ExitCode). Error: $errorContent" -ForegroundColor Red
+        Remove-Item "$WORKING_FOLDER\ssh_error.txt" -Force -ErrorAction SilentlyContinue
+        Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+        exit 1
     }
-    Write-Log "Fetching '$RemotePath' to '$LocalPath'..." -ForegroundColor Green
-    Write-Log "SCP will display progress below; this may take a while for large files or slow connections." -ForegroundColor Cyan
-
-    try {
-        # Run scp, wait for completion, and capture output
-        $scpOutput = Start-Process -FilePath "scp" -ArgumentList "$RemotePath", "$LocalPath" -Wait -NoNewWindow -PassThru -RedirectStandardOutput "scp_output.txt" -RedirectStandardError "scp_error.txt"
-        
-        # Log scp output
-        if (Test-Path "scp_output.txt") {
-            Get-Content "scp_output.txt" | ForEach-Object { Write-Log $_ -ForegroundColor Green }
-            Remove-Item "scp_output.txt" -Force
-        }
-        if (Test-Path "scp_error.txt") {
-            $errorContent = Get-Content "scp_error.txt"
-            if ($errorContent) { throw "SCP error: $errorContent" }
-            Remove-Item "scp_error.txt" -Force
-        }
-
-        # Check exit code
-        if ($scpOutput.ExitCode -ne 0) {
-            throw "SCP process failed with exit code $($scpOutput.ExitCode)."
-        }
-
-        # Final check with short retry for filesystem lag
-        $retryCount = 0
-        $maxRetries = 20  # 10 seconds total
-        while (-not (Test-Path $LocalPath) -and $retryCount -lt $maxRetries) {
-            Start-Sleep -Milliseconds 500
-            $retryCount++
-            Write-Log "Waiting for '$LocalPath' to appear (attempt $retryCount/$maxRetries)..." -ForegroundColor Yellow
-        }
-        if (-not (Test-Path $LocalPath)) {
-            throw "File not fetched after SCP completion."
-        }
-        Write-Log "'$LocalPath' confirmed present." -ForegroundColor Green
-    }
-    catch {
-        Write-Log "Error: Fetch failed. $_" -ForegroundColor Red
-        Write-Log "Check file name, SSH setup, or network connectivity." -ForegroundColor Yellow
+    
+    $md5Output = Get-Content $tempFile -ErrorAction SilentlyContinue
+    Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+    Remove-Item "$WORKING_FOLDER\ssh_error.txt" -Force -ErrorAction SilentlyContinue
+    
+    if ($md5Output -match "^([a-f0-9]{32})") {
+        return $matches[1]
+    } else {
+        Write-Log "Error: Failed to parse MD5 hash from '$md5Output'." -ForegroundColor Red
         exit 1
     }
 }
 
-function Copy-ToOneDrive {
-    param ([string]$Source, [string]$Dest)
-    if (Test-Path $Dest) {
-        if (-not (Confirm-Action "Overwrite existing file in OneDrive '$Dest'?")) {
-            Write-Log "OneDrive copy skipped." -ForegroundColor Yellow
-            return
-        }
+function Get-LocalFileMD5 {
+    <#
+    .SYNOPSIS
+        Calculates the MD5 hash of a local file.
+    #>
+    param ([string]$LocalPath)
+    if (Test-Path $LocalPath) {
+        Write-Log "Calculating MD5 hash for local file '$LocalPath'..." -ForegroundColor Green
+        $md5 = Get-FileHash -Path $LocalPath -Algorithm MD5
+        return $md5.Hash.ToLower()
     }
-    Write-Log "Copying to OneDrive..." -ForegroundColor Green
-    Copy-Item -Path $Source -Destination $Dest -Force
+    return $null
+}
+
+function Copy-BackupFromRemote {
+    <#
+    .SYNOPSIS
+        Fetches the backup file from the remote server using SCP, skipping if MD5 matches or appending a note if different.
+    #>
+    param ([string]$RemotePath)
+    $fileName = Split-Path -Leaf $RemotePath
+    $localFilePath = Join-Path -Path $ENCRYPTED_BACKUPS_FOLDER -ChildPath $fileName
+    
+    Write-Log "Checking if '$localFilePath' exists..." -ForegroundColor Cyan
+    if (Test-Path $localFilePath) {
+        Write-Log "File '$localFilePath' exists." -ForegroundColor Yellow
+        $remoteMD5 = Get-RemoteFileMD5 -RemotePath $RemotePath
+        $localMD5 = Get-LocalFileMD5 -LocalPath $localFilePath
+        
+        if ($remoteMD5 -eq $localMD5) {
+            Write-Log "MD5 hash match: Remote ($remoteMD5) = Local ($localMD5). Skipping download." -ForegroundColor Green
+            return $localFilePath
+        } else {
+            Write-Log "MD5 hash mismatch: Remote ($remoteMD5) != Local ($localMD5). Downloading with appended note." -ForegroundColor Yellow
+            $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+            $newFileName = "$([System.IO.Path]::GetFileNameWithoutExtension($fileName))_downloaded_$timestamp$([System.IO.Path]::GetExtension($fileName))"
+            $newLocalPath = Join-Path -Path $ENCRYPTED_BACKUPS_FOLDER -ChildPath $newFileName
+            
+            Write-Log "Fetching '$RemotePath' to '$newLocalPath'..." -ForegroundColor Green
+            $scpProcess = Start-Process -FilePath "scp" -ArgumentList "$RemotePath", "$newLocalPath" -Wait -PassThru
+            if ($scpProcess.ExitCode -ne 0) {
+                Write-Log "Error: SCP failed with exit code $($scpProcess.ExitCode)." -ForegroundColor Red
+                exit 1
+            }
+            Start-Sleep -Milliseconds 500
+            if (-not (Test-Path $newLocalPath)) {
+                Write-Log "Error: File '$newLocalPath' not found after SCP transfer." -ForegroundColor Red
+                exit 1
+            }
+            Write-Log "Fetch completed successfully. Stored as '$newLocalPath'." -ForegroundColor Green
+            return $newLocalPath
+        }
+    } else {
+        Write-Log "No existing file at '$localFilePath'. Downloading..." -ForegroundColor Green
+        $scpProcess = Start-Process -FilePath "scp" -ArgumentList "$RemotePath", "$localFilePath" -Wait -PassThru
+        if ($scpProcess.ExitCode -ne 0) {
+            Write-Log "Error: SCP failed with exit code $($scpProcess.ExitCode)." -ForegroundColor Red
+            exit 1
+        }
+        Start-Sleep -Milliseconds 500
+        if (-not (Test-Path $localFilePath)) {
+            Write-Log "Error: File '$localFilePath' not found after SCP transfer." -ForegroundColor Red
+            exit 1
+        }
+        Write-Log "Fetch completed successfully. Stored as '$localFilePath'." -ForegroundColor Green
+        return $localFilePath
+    }
+}
+
+function Get-EncryptedBackupToDecrypt {
+    <#
+    .SYNOPSIS
+        Lists encrypted backups in ENCRYPTED_BACKUPS_FOLDER and prompts user to select one for decryption.
+    #>
+    Write-Log "Listing available encrypted backups in '$ENCRYPTED_BACKUPS_FOLDER'..." -ForegroundColor Green
+    $files = Get-ChildItem -Path $ENCRYPTED_BACKUPS_FOLDER -File -Filter "*.tar.gz.gpg" | Sort-Object LastWriteTime -Descending
+    
+    if (-not $files) {
+        Write-Log "Error: No encrypted backup files found in '$ENCRYPTED_BACKUPS_FOLDER'." -ForegroundColor Red
+        exit 1
+    }
+    
+    Write-Log "Available encrypted backups:" -ForegroundColor Yellow
+    $index = 0
+    foreach ($file in $files) {
+        Write-Host "$index : $($file.Name) (Last Modified: $($file.LastWriteTime))"
+        $index++
+    }
+    
+    do {
+        $selection = Read-Host "Enter the number of the file to decrypt (0-$($files.Count - 1))"
+        if ($selection -match '^\d+$' -and [int]$selection -ge 0 -and [int]$selection -lt $files.Count) {
+            $selectedFile = $files[$selection].Name
+            Write-Log "User selected: '$selectedFile'" -ForegroundColor Green
+            return $selectedFile
+        } else {
+            Write-Log "Invalid selection. Please enter a number between 0 and $($files.Count - 1)." -ForegroundColor Red
+        }
+    } while ($true)
 }
 
 function ConvertTo-DecryptedBackup {
+    <#
+    .SYNOPSIS
+        Decrypts the GPG-encrypted backup file.
+    #>
     param ([string]$EncryptedPath, [string]$DecryptedPath)
+    Write-Log "Checking if '$DecryptedPath' exists..." -ForegroundColor Cyan
     if (Test-Path $DecryptedPath) {
+        Write-Log "File '$DecryptedPath' exists. Contents of working folder:" -ForegroundColor Yellow
+        Get-ChildItem -Path (Split-Path -Parent $DecryptedPath) -Force | ForEach-Object { Write-Log "  $($_.Name)" -ForegroundColor Yellow }
         if (-not (Confirm-Action "Overwrite existing decrypted file '$DecryptedPath'?")) {
             Write-Log "Decryption cancelled." -ForegroundColor Red
             exit 1
         }
+    } else {
+        Write-Log "No existing file at '$DecryptedPath'." -ForegroundColor Green
     }
-    Write-Log "Decrypting with YubiKey..." -ForegroundColor Green
-    try {
-        gpg --verbose --output $DecryptedPath --decrypt $EncryptedPath
-    }
-    catch {
-        Write-Log "Error: Decryption failed. $_" -ForegroundColor Red
-        Write-Log "Ensure YubiKey is plugged in and key is imported." -ForegroundColor Yellow
-        exit 1
-    }
+    Write-Log "Decrypting '$EncryptedPath' to '$DecryptedPath' with GPG..." -ForegroundColor Green
+    gpg --verbose --output $DecryptedPath --decrypt $EncryptedPath
 }
 
 function Expand-Backup {
-    param (
-        [string]$ArchivePath,
-        [string]$OutputFolder
-    )
+    <#
+    .SYNOPSIS
+        Extracts the decrypted backup using 7-Zip.
+    #>
+    param ([string]$ArchivePath, [string]$OutputFolder)
     Write-Log "Expanding '$ArchivePath' to '$OutputFolder'..." -ForegroundColor Green
-    
-    # Derive expected .tar file name from .tar.gz (remove .gz)
     $tempTarPath = $ArchivePath -replace '\.gz$', ''
     
-    try {
-        Write-Log "Extracting .tar.gz to temporary .tar..." -ForegroundColor Green
-        Start-Process -FilePath $SEVENZIP_PATH -ArgumentList "x", "$ArchivePath", "-o$OutputFolder", "-y" -Wait -NoNewWindow
-        
-        # Retry loop to ensure .tar file appears
-        $retryCount = 0
-        $maxRetries = 5
-        while (-not (Test-Path $tempTarPath) -and $retryCount -lt $maxRetries) {
-            Start-Sleep -Milliseconds 500
-            $retryCount++
-            Write-Log "Waiting for '$tempTarPath' to appear (attempt $retryCount/$maxRetries)..." -ForegroundColor Yellow
-        }
-        if (-not (Test-Path $tempTarPath)) {
-            # Fallback: Check for any .tar file in $OutputFolder
-            $tarFile = Get-ChildItem -Path $OutputFolder -Filter "*.tar" | Select-Object -First 1
-            if ($tarFile) {
-                $tempTarPath = $tarFile.FullName
-                Write-Log "Detected unexpected .tar file '$tempTarPath' instead." -ForegroundColor Yellow
-            }
-            else {
-                throw "Intermediate .tar file not created after $maxRetries attempts."
-            }
-        }
-        Write-Log "'$tempTarPath' confirmed present." -ForegroundColor Green
-
-        Write-Log "Extracting .tar to final contents..." -ForegroundColor Green
-        Start-Process -FilePath $SEVENZIP_PATH -ArgumentList "x", "$tempTarPath", "-o$OutputFolder", "-y" -Wait -NoNewWindow
-        
-        Write-Log "Securely deleting temporary .tar file..." -ForegroundColor Green
-        Remove-SecureFile -Path $tempTarPath
-        Write-Log "Securely deleting decrypted .tar.gz file..." -ForegroundColor Green
-        Remove-SecureFile -Path $ArchivePath
-        Write-Log "Extraction and cleanup complete." -ForegroundColor Green
+    Start-Process -FilePath $SEVENZIP_PATH -ArgumentList "x", "$ArchivePath", "-o$OutputFolder", "-y" -Wait -NoNewWindow
+    if (-not (Test-Path $tempTarPath)) {
+        Write-Log "Error: Intermediate .tar file not created." -ForegroundColor Red
+        throw "Extraction failed"
     }
-    catch {
-        Write-Log "Error: Expansion failed. $_" -ForegroundColor Red
-        
-        # Retry cleanup with delay
-        $retryCount = 0
-        $maxRetries = 3
-        while ((Test-Path $tempTarPath -or Test-Path $ArchivePath) -and $retryCount -lt $maxRetries) {
-            if (Test-Path $tempTarPath) {
-                Write-Log "Emergency cleanup: Securely deleting temporary .tar file..." -ForegroundColor Yellow
-                Remove-SecureFile -Path $tempTarPath
-                if (Test-Path $tempTarPath) {
-                    Write-Log "Critical: Temporary .tar file still exists!" -ForegroundColor Red
-                }
-            }
-            if (Test-Path $ArchivePath) {
-                Write-Log "Emergency cleanup: Securely deleting decrypted .tar.gz file..." -ForegroundColor Yellow
-                Remove-SecureFile -Path $ArchivePath
-                if (Test-Path $ArchivePath) {
-                    Write-Log "Critical: Decrypted .tar.gz file still exists!" -ForegroundColor Red
-                }
-            }
-            if (Test-Path $tempTarPath -or Test-Path $ArchivePath) {
-                Start-Sleep -Seconds 1
-                $retryCount++
-                Write-Log "Retrying cleanup (attempt $retryCount/$maxRetries)..." -ForegroundColor Yellow
-            }
-        }
-        # Final check for any stray .tar files
-        $strayTarFiles = Get-ChildItem -Path $OutputFolder -Filter "*.tar"
-        foreach ($stray in $strayTarFiles) {
-            Write-Log "Emergency cleanup: Found stray .tar file '$($stray.FullName)', deleting..." -ForegroundColor Yellow
-            Remove-SecureFile -Path $stray.FullName
-        }
-        if (Test-Path $tempTarPath -or Test-Path $ArchivePath -or $strayTarFiles) {
-            Write-Log "Critical: Cleanup incomplete after retries. Manual intervention required." -ForegroundColor Red
-        }
-        exit 1
-    }
+    
+    Start-Process -FilePath $SEVENZIP_PATH -ArgumentList "x", "$tempTarPath", "-o$OutputFolder", "-y" -Wait -NoNewWindow
+    
+    Remove-SecureFile -Path $tempTarPath
+    Remove-SecureFile -Path $ArchivePath
 }
+# endregion
 
-# Main Execution
+# region Main Execution
 Write-Banner
 Test-Prerequisites
 
@@ -376,56 +396,30 @@ if ($WipeConfidential) {
 }
 
 try {
-    $fileName = Get-BackupFileName
-    $remotePath = "${SSH_USER}@${DOMAIN}:/home/${SSH_USER}/backups/${fileName}"
-    $localPath = Join-Path -Path $BACKUPS_FOLDER -ChildPath $fileName
-    $oneDrivePath = Join-Path -Path $ONEDRIVE_FOLDER -ChildPath $fileName
-    $decryptedPath = "$BACKUPS_FOLDER\decrypted_backup.tar.gz"
+    if ($Decrypt) {
+        $selectedFile = Get-EncryptedBackupToDecrypt
+        $encryptedPath = Join-Path -Path $ENCRYPTED_BACKUPS_FOLDER -ChildPath $selectedFile
+        $decryptedPath = Join-Path -Path $WORKING_FOLDER -ChildPath "decrypted_backup.tar.gz"
 
-    Copy-BackupFromRemote -RemotePath $remotePath -LocalPath $localPath
-    Copy-ToOneDrive -Source $localPath -Dest $oneDrivePath
-    ConvertTo-DecryptedBackup -EncryptedPath $localPath -DecryptedPath $decryptedPath
-    Expand-Backup -ArchivePath $decryptedPath -OutputFolder $BACKUPS_FOLDER
-    Write-Log "Cleanup: Deleting encrypted local backup file '$localPath'..." -ForegroundColor Green
-    Remove-Item -Path $localPath -Force
-    if (Test-Path $localPath) {
-        Write-Log "Warning: Encrypted local backup file '$localPath' still exists!" -ForegroundColor Yellow
+        ConvertTo-DecryptedBackup -EncryptedPath $encryptedPath -DecryptedPath $decryptedPath
+        Expand-Backup -ArchivePath $decryptedPath -OutputFolder $WORKING_FOLDER
+        Write-Log "Process complete. Check '$WORKING_FOLDER' for expanded files." -ForegroundColor Green
+        Write-Log "Encrypted backup retained at '$encryptedPath'." -ForegroundColor Green
+    } else {
+        # Default action: Fetch the latest remote backup
+        $fileName = Get-LatestRemoteBackup
+        $remotePath = "$REMOTE_HOST`:$REMOTE_BACKUP_DIR/$fileName"
+        $localPath = Copy-BackupFromRemote -RemotePath $remotePath
+        
+        Write-Log "Latest backup processed and stored at '$localPath'. Use -Decrypt to proceed with decryption." -ForegroundColor Green
     }
-}
-catch {
-    Write-Log "Error: Backup process failed. $_" -ForegroundColor Red
-    $retryCount = 0
-    $maxRetries = 3
-    while ((Test-Path $decryptedPath -or Test-Path $localPath) -and $retryCount -lt $maxRetries) {
-        if (Test-Path $decryptedPath) {
-            Write-Log "Emergency cleanup: Securely deleting decrypted .tar.gz file..." -ForegroundColor Yellow
-            Remove-SecureFile -Path $decryptedPath
-            if (Test-Path $decryptedPath) {
-                Write-Log "Critical: Decrypted .tar.gz file still exists!" -ForegroundColor Red
-            }
-        }
-        Write-Log "Local Path: '$localPath'..." -ForegroundColor Yellow
-        if (Test-Path $localPath) {
-            Remove-Item -Path $localPath -Force
-            if (Test-Path $localPath) {
-                Write-Log "Warning: Encrypted local backup file '$localPath' still exists!" -ForegroundColor Yellow
-            }
-        }
-        if (Test-Path $decryptedPath -or Test-Path $localPath) {
-            Start-Sleep -Seconds 1
-            $retryCount++
-            Write-Log "Retrying cleanup (attempt $retryCount/$maxRetries)..." -ForegroundColor Yellow
-        }
-    }
-    if (Test-Path $decryptedPath -or Test-Path $localPath) {
-        Write-Log "Critical: Cleanup incomplete after retries. Manual intervention required." -ForegroundColor Red
-    }
+} catch {
+    Write-Log "Error: Process failed. $_" -ForegroundColor Red
+    if (Test-Path $decryptedPath) { Remove-SecureFile -Path $decryptedPath }
     exit 1
 }
-finally {
-    Remove-ConfidentialFiles
-}
 
-Write-Log "Process complete. Check '$ODOO_FOLDER' for expanded files." -ForegroundColor Green
-Write-Log "CRITICAL: '$ODOO_FOLDER' contains sensitive data. Use -WipeConfidential to delete." -ForegroundColor Red
-Write-Log "For end-of-life disposal, run 'sdelete -z C:' then physically destroy the drive." -ForegroundColor Cyan
+if ($Decrypt) {
+    Write-Log "CRITICAL: '$WORKING_FOLDER' contains sensitive data. Use -WipeConfidential to delete." -ForegroundColor Red
+}
+# endregion
